@@ -9,8 +9,7 @@ const PORT = process.env.PORT || 3000;
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
 ];
 
 function getRandomUA() {
@@ -26,86 +25,135 @@ function extractProductId(url) {
   return match ? match[1] : null;
 }
 
-async function scrapeViaHTML(url, retries = 3) {
+async function scrapeWithRetry(url, retries = 2) {
+  // Try with cookies session first
   for (let i = 0; i < retries; i++) {
     try {
-      if (i > 0) await sleep(2000 * i);
+      if (i > 0) await sleep(3000 * i);
+
+      // First get a session cookie from the homepage
+      let cookies = '';
+      try {
+        const homeResp = await axios.get('https://www.coupang.com/', {
+          headers: {
+            'User-Agent': getRandomUA(),
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'ko-KR,ko;q=0.9'
+          },
+          timeout: 10000,
+          maxRedirects: 3
+        });
+        const setCookie = homeResp.headers['set-cookie'];
+        if (setCookie) {
+          cookies = setCookie.map(c => c.split(';')[0]).join('; ');
+        }
+      } catch (e) {
+        // ignore cookie prefetch error
+      }
+
       const response = await axios.get(url, {
         headers: {
           'User-Agent': getRandomUA(),
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8',
           'Accept-Encoding': 'gzip, deflate, br',
           'Cache-Control': 'no-cache',
           'Pragma': 'no-cache',
-          'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-          'sec-ch-ua-mobile': '?0',
-          'sec-ch-ua-platform': '"Windows"',
+          'Referer': 'https://www.coupang.com/',
+          'Cookie': cookies || '',
           'Sec-Fetch-Dest': 'document',
           'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-Site': 'same-origin',
           'Upgrade-Insecure-Requests': '1',
-          'Referer': 'https://www.coupang.com/'
+          'Connection': 'keep-alive'
         },
         timeout: 30000,
         maxRedirects: 5
       });
 
-      const $ = cheerio.load(response.data);
+      const html = response.data;
+      const $ = cheerio.load(html);
+      const htmlLen = html.length;
 
-      // Extract product name
-      const productName = $('h1.prod-buy-header__title').text().trim() ||
-        $('[class*="prod-title"]').first().text().trim() ||
-        $('title').text().replace(' : 쿠팡', '').trim();
+      // Extract product name - multiple selectors
+      let productName = '';
+      const nameSelectors = [
+        'h1.prod-buy-header__title',
+        '.prod-buy-header__title',
+        '[class*="prod-title"]',
+        'h1',
+        'meta[property="og:title"]'
+      ];
+      for (const sel of nameSelectors) {
+        const val = sel.includes('meta') 
+          ? $(sel).attr('content') 
+          : $(sel).first().text().trim();
+        if (val && val.length > 2) {
+          productName = val.replace(' : 쿠팡', '').trim();
+          break;
+        }
+      }
 
       // Extract price
-      const priceText = $('[class*="price-value"]').first().text().trim() ||
-        $('[class*="total-price"]').first().text().trim() ||
-        $('strong.price').first().text().trim();
-      const priceKRW = parseInt(priceText.replace(/[^0-9]/g, '')) || 0;
+      const priceSelectors = [
+        '[class*="price-value"]',
+        '[class*="total-price"]',
+        '.prod-coupon-price',
+        '[class*="prod-price"]',
+        'strong.price'
+      ];
+      let priceKRW = 0;
+      for (const sel of priceSelectors) {
+        const text = $(sel).first().text().trim();
+        const num = parseInt(text.replace(/[^0-9]/g, ''));
+        if (num > 0) { priceKRW = num; break; }
+      }
 
-      // Extract description
-      const description = $('[class*="prod-description"]').text().trim() ||
-        $('meta[name="description"]').attr('content') || '';
+      // Extract meta description
+      const description = $('meta[name="description"]').attr('content') ||
+        $('meta[property="og:description"]').attr('content') || '';
 
-      // Extract main images
+      // Main product images from og:image and product thumbnails
       const mainImages = [];
-      $('[class*="prod-image"] img, [class*="thumbnail"] img').each((i, el) => {
+      const ogImage = $('meta[property="og:image"]').attr('content');
+      if (ogImage) mainImages.push(ogImage);
+
+      $('[class*="prod-image"] img, [class*="thumbnail"] img, .prod-img img').each((i, el) => {
         const src = $(el).attr('src') || $(el).attr('data-src');
-        if (src && src.includes('coupang') && !mainImages.includes(src)) {
+        if (src && !mainImages.includes(src)) {
           mainImages.push(src.startsWith('//') ? 'https:' + src : src);
         }
       });
 
-      // Extract detail images (product description images)
+      // Detail images
       const detailImages = [];
-      $('[class*="detail"] img, #productDetailContent img, .product-content img').each((i, el) => {
+      $('[id*="detail"] img, [class*="detail"] img, #productDetailContent img').each((i, el) => {
         const src = $(el).attr('src') || $(el).attr('data-src');
-        if (src && !detailImages.includes(src)) {
-          detailImages.push(src.startsWith('//') ? 'https:' + src : src);
+        if (src) {
+          const full = src.startsWith('//') ? 'https:' + src : src;
+          if (!detailImages.includes(full)) detailImages.push(full);
         }
       });
 
-      // Extract rating
-      const ratingText = $('[class*="rating"] span').first().text().trim();
-      const rating = parseFloat(ratingText) || 0;
-
-      // Extract review count
-      const reviewText = $('[class*="review-count"]').first().text().trim();
-      const reviewCount = parseInt(reviewText.replace(/[^0-9]/g, '')) || 0;
-
-      // Extract all images from page for detail scraping
+      // All images on page (for fallback)
       const allDetailImages = [];
       $('img').each((i, el) => {
         const src = $(el).attr('src') || $(el).attr('data-src');
-        if (src && (src.includes('thumbnail') || src.includes('detail') || src.includes('prod-img'))) {
-          const fullSrc = src.startsWith('//') ? 'https:' + src : src;
-          if (!allDetailImages.includes(fullSrc)) allDetailImages.push(fullSrc);
+        if (src) {
+          const full = src.startsWith('//') ? 'https:' + src : src;
+          if (!allDetailImages.includes(full)) allDetailImages.push(full);
         }
       });
 
+      // Rating and reviews
+      const ratingText = $('[class*="rating"] span, .rating').first().text().trim();
+      const rating = parseFloat(ratingText) || 0;
+      const reviewText = $('[class*="review-count"], [class*="count-area"]').first().text().trim();
+      const reviewCount = parseInt(reviewText.replace(/[^0-9]/g, '')) || 0;
+
       return {
         url,
+        productId: extractProductId(url),
         productName,
         priceKRW,
         description,
@@ -114,11 +162,30 @@ async function scrapeViaHTML(url, retries = 3) {
         allDetailImages,
         rating,
         reviewCount,
-        scrapedAt: new Date().toISOString(),
-        rawHtmlLength: response.data.length
+        htmlLength: htmlLen,
+        scrapedAt: new Date().toISOString()
       };
+
     } catch (err) {
-      if (i === retries - 1) throw err;
+      console.error(`Attempt ${i + 1} failed:`, err.message);
+      if (i === retries - 1) {
+        // Return structured error response with what we know
+        return {
+          url,
+          productId: extractProductId(url),
+          productName: '',
+          priceKRW: 0,
+          description: '',
+          mainImages: [],
+          detailImages: [],
+          allDetailImages: [],
+          rating: 0,
+          reviewCount: 0,
+          htmlLength: 0,
+          error: err.message,
+          scrapedAt: new Date().toISOString()
+        };
+      }
     }
   }
 }
@@ -128,7 +195,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Main scrape endpoint
+// Main scrape endpoint - returns success:true even with partial data
 app.post('/scrape', async (req, res) => {
   const { url } = req.body;
 
@@ -141,15 +208,17 @@ app.post('/scrape', async (req, res) => {
   }
 
   try {
-    const data = await scrapeViaHTML(url);
+    const data = await scrapeWithRetry(url);
+    // Always return 200 with success:true so n8n workflow continues
+    // The workflow can check if productName is empty
     res.json({ success: true, data });
   } catch (error) {
-    console.error('Scrape error:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
+    console.error('Unhandled scrape error:', error.message);
+    res.json({
+      success: true,
       data: {
         url,
+        productId: extractProductId(url),
         productName: '',
         priceKRW: 0,
         description: '',
@@ -158,6 +227,8 @@ app.post('/scrape', async (req, res) => {
         allDetailImages: [],
         rating: 0,
         reviewCount: 0,
+        htmlLength: 0,
+        error: error.message,
         scrapedAt: new Date().toISOString()
       }
     });
