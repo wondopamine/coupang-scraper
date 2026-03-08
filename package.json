@@ -1,19 +1,17 @@
 {
-  "name": "coupang-scraper",
-  "version": "1.0.0",
-  "description": "Coupang product scraper API",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2",
-        "puppeteer": "^22.0.0",
-        "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "iconv-lite": "^0.6.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+    "name": "coupang-scraper",
+    "version": "3.0.0",
+    "description": "Coupang product scraper API - multi-strategy",
+    "main": "server.js",
+    "scripts": {
+          "start": "node server.js"
+    },
+    "dependencies": {
+          "express": "^4.18.2",
+          "axios": "^1.6.7",
+          "cheerio": "1.0.0-rc.12"
+    },
+    "engines": {
+          "node": ">=18.0.0"
+    }
 }
