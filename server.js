@@ -25,22 +25,23 @@ function extractProductId(url) {
 let browser = null;
 
 async function getBrowser() {
-  if (!browser) {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1920x1080',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process'
-      ],
-      ignoreHTTPSErrors: true
-    });
+  if (browser) {
+    return browser;
   }
+  browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--window-size=1920x1080',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process'
+    ],
+    ignoreHTTPSErrors: true
+  });
   return browser;
 }
 
@@ -66,24 +67,24 @@ async function scrapeCoupangWithPuppeteer(url) {
     await sleep(Math.random() * 2000 + 1000);
     
     console.log('Navigating to:', url);
-    await page.goto(url, { 
-      waitUntil: 'domcontentloaded',
-      timeout: 45000 
+    await page.goto(url, {
+      waitUntil: 'networkidle0',
+      timeout: 60000
     });
     
-    // Wait for page to load
-    await sleep(3000);
+    // Wait for page to load with longer timeout
+    await sleep(5000);
     
     // Check if we got an access denied page
     const pageContent = await page.content();
-    if (pageContent.includes('Access Denied') || pageContent.includes('차단') || pageContent.includes('접근이 거부')) {
-      console.log('Access denied detected, trying alternative selectors...');
+    if (pageContent.includes('Access Denied') || pageContent.includes('차단') || pageContent.includes('접근이 거부') || pageContent.includes('찾을 수 없습니다')) {
+      console.log('Access denied or product not found detected');
     }
     
     // Take a screenshot for debugging
     // await page.screenshot({ path: '/tmp/screenshot.png' });
     
-    // Extract product data with multiple fallback strategies
+    // Extract product data - wait for specific elements
     const data = await page.evaluate(() => {
       // Helper function to safely get text
       const getText = (selector) => {
@@ -97,194 +98,156 @@ async function scrapeCoupangWithPuppeteer(url) {
         return el ? el.getAttribute(attr) : '';
       };
       
-      // Product name - try multiple selectors
+      // Product name - looking for h1 or h2 with prod-buy-header__title class or similar
       let productName = '';
       const nameSelectors = [
-        'h1.prod-buy-header__title',
+        'h1',
+        'h2',
         '.prod-buy-header__title',
+        'h1.prod-buy-header__title',
         'h2.prod-buy-header__title',
-        '[class*="prod-buy"] h1',
-        '[class*="prod-buy"] h2',
-        '.prod-title',
-        '#btfDetail h2',
-        'meta[property="og:title"]'
+        '[class*=\"prod\"][class*=\"title\"]'
       ];
       
       for (const sel of nameSelectors) {
-        if (sel.includes('meta')) {
-          productName = getAttr(sel, 'content');
-        } else {
-          productName = getText(sel);
-        }
-        if (productName && productName.length > 2) {
-          productName = productName.replace(/ : 쿠팡$/,'').replace(/쿠팡$/,'').trim();
+        const text = getText(sel);
+        if (text && text.length > 3) {
+          productName = text;
           break;
         }
       }
       
+      // Fallback to meta tag
+      if (!productName) {
+        productName = getAttr('meta[property=\"og:title\"]', 'content');
+      }
+      
       // Price - try multiple selectors
-      let priceKRW = 0;
+      let priceKRW = '';
       const priceSelectors = [
         '.total-price strong',
-        '.total-price span',
+        '.total-price',
         '.price-value',
-        '[class*="total-price"] strong',
-        '[class*="total-price"] span',
-        '[class*="price-value"]',
-        '.prod-price .total-price',
-        '.sale-price',
-        '.base-price'
+        '[class*=\"sale\"][class*=\"price\"]',
+        '[class*=\"total\"][class*=\"price\"]',
+        '.prod-price',
+        'meta[property=\"product:price:amount\"]'
       ];
       
       for (const sel of priceSelectors) {
-        const text = getText(sel);
-        if (text) {
-          const num = parseInt(text.replace(/[^0-9]/g, ''));
-          if (num > 0) {
-            priceKRW = num;
+        if (sel.includes('meta')) {
+          const price = getAttr(sel, 'content');
+          if (price) {
+            priceKRW = price;
+            break;
+          }
+        } else {
+          const text = getText(sel);
+          if (text && /\d/.test(text)) {
+            priceKRW = text.replace(/[^0-9]/g, '');
             break;
           }
         }
       }
       
-      // Description
-      let description = getAttr('meta[name="description"]', 'content') ||
-                       getAttr('meta[property="og:description"]', 'content') ||
-                       getText('.prod-description') ||
-                       '';
-      
-      // Images - comprehensive collection
-      const allImages = [];
-      
-      // Try og:image first
-      const ogImage = getAttr('meta[property="og:image"]', 'content');
-      if (ogImage) allImages.push(ogImage);
-      
-      // Product gallery images
-      const imageSelectors = [
-        '.prod-image__detail img',
-        '.prod-image__item img',
-        '.prod-image-container img',
-        '[class*="prod-image"] img',
-        '#btfDetail img',
-        '.product-image img',
-        '.detail-image img'
+      // Description - try multiple selectors
+      let description = '';
+      const descSelectors = [
+        '.prod-description',
+        '#btfDetail',
+        '.product-detail',
+        '[class*=\"description\"]'
       ];
       
-      // Collect all images
-      document.querySelectorAll('img').forEach(img => {
-        let src = img.src || img.dataset.src || img.getAttribute('data-src') || img.getAttribute('data-original');
-        if (!src && img.hasAttribute('srcset')) {
-          const srcset = img.getAttribute('srcset');
-          const urls = srcset.split(',').map(s => s.trim().split(' ')[0]);
-          src = urls[urls.length - 1]; // Get highest quality
+      for (const sel of descSelectors) {
+        const text = getText(sel);
+        if (text && text.length > 10) {
+          description = text.substring(0, 500);
+          break;
         }
-        if (src) {
-          if (src.startsWith('//')) src = 'https:' + src;
-          if (src.startsWith('http') && !allImages.includes(src)) {
-            // Filter out tiny icons, logos, and UI elements
-            if (!src.includes('1x1') && 
-                !src.includes('blank') && 
-                !src.includes('logo') &&
-                !src.includes('icon') &&
-                !src.match(/\/(\d{1,2})x(\d{1,2})\//)) {
-              allImages.push(src);
-            }
-          }
+      }
+      
+      // Images
+      const images = [];
+      const imgElements = document.querySelectorAll('img[src*=\"coupang\"], img[alt*=\"Product\"]');
+      imgElements.forEach(img => {
+        const src = img.src || img.getAttribute('data-src');
+        if (src && !src.includes('icon') && !src.includes('logo')) {
+          images.push(src);
         }
       });
       
       return {
-        productName,
-        priceKRW,
-        description: description.slice(0, 500),
-        mainImages: allImages.slice(0, 10),
-        detailImages: allImages.slice(10, 30),
-        allDetailImages: allImages.slice(0, 30),
-        totalImagesFound: allImages.length
+        productName: productName || 'empty',
+        priceKRW: priceKRW || '0',
+        priceUSD: '0',
+        description: description || 'No description',
+        images: images.slice(0, 5)
       };
     });
     
-    console.log('Scrape result:', JSON.stringify({
-      productName: data.productName,
-      priceKRW: data.priceKRW,
-      imagesFound: data.totalImagesFound
-    }));
-    
     await page.close();
     
+    console.log('Scraped data:', data);
     return {
-      url,
-      productId: extractProductId(url),
-      productName: data.productName || '',
-      priceKRW: data.priceKRW || 0,
-      priceUSD: Math.round(data.priceKRW / 1350 * 100) / 100,
-      description: data.description || '',
-      mainImages: data.mainImages || [],
-      detailImages: data.detailImages || [],
-      allDetailImages: data.allDetailImages || [],
-      rating: 0,
-      reviewCount: 0,
-      scrapedAt: new Date().toISOString(),
-      source: 'coupang'
+      success: true,
+      data: {
+        url: url,
+        productId: extractProductId(url),
+        ...data
+      }
     };
     
   } catch (error) {
-    console.error('Scrape error:', error.message);
+    console.error('Scraping error:', error);
     await page.close();
-    throw new Error(`Coupang scrape failed: ${error.message}`);
+    return {
+      success: false,
+      error: error.message,
+      data: {
+        url: url,
+        productId: extractProductId(url),
+        productName: 'Error: ' + error.message,
+        priceKRW: '0',
+        priceUSD: '0',
+        description: '',
+        images: []
+      }
+    };
   }
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
+// Scrape endpoint
 app.post('/scrape', async (req, res) => {
-  const { url } = req.body;
-  
-  if (!url) {
-    return res.status(400).json({ success: false, error: 'URL is required' });
-  }
-  
   try {
-    let data;
+    const { url } = req.body;
     
-    if (url.includes('coupang.com')) {
-      data = await scrapeCoupangWithPuppeteer(url);
-    } else {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Only Coupang URLs are supported' 
-      });
+    if (!url) {
+      return res.status(400).json({ success: false, error: 'URL is required' });
     }
     
-    res.json({ success: true, data });
+    console.log('Received scrape request for:', url);
+    
+    const result = await scrapeCoupangWithPuppeteer(url);
+    res.json(result);
     
   } catch (error) {
-    console.error('Scrape error:', error.message);
-    res.json({
-      success: true,
-      data: {
-        url,
-        productId: extractProductId(url),
-        productName: '',
-        priceKRW: 0,
-        priceUSD: 0,
-        description: '',
-        mainImages: [],
-        detailImages: [],
-        allDetailImages: [],
-        rating: 0,
-        reviewCount: 0,
-        error: error.message,
-        scrapedAt: new Date().toISOString(),
-        source: 'coupang'
-      }
+    console.error('Endpoint error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
     });
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Product scraper with Puppeteer + Stealth running on port ${PORT}`);
+// Health check
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'Product scraper with Puppeteer running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Product scraper with Puppeteer running on port ${PORT}`);
 });
